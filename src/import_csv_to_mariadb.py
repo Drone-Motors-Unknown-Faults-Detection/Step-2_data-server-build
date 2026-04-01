@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import math
 import os
 import re
 import sys
@@ -219,7 +220,9 @@ def _try_float(s: str) -> float | None:
     if s == "":
         return None
     try:
-        return float(s)
+        v = float(s)
+        # Reject NaN and Infinity — not valid MariaDB DOUBLE values
+        return None if (math.isnan(v) or math.isinf(v)) else v
     except ValueError:
         return None
 
@@ -305,8 +308,10 @@ def _insert_long(
     def gen_params() -> Iterator[tuple]:
         for r_idx, row in enumerate(rows_iter, start=1):
             for c_idx, cell in enumerate(row, start=1):
-                vf = _try_float(cell)
-                vs = None if vf is not None else (cell.strip()[:4000] if cell is not None else None)
+                stripped = cell.strip() if cell else ""
+                vf = _try_float(stripped)
+                # Store NULL for empty cells and numeric values; text only for non-numeric, non-empty cells
+                vs = None if (vf is not None or not stripped) else stripped[:4000]
                 col_name = header[c_idx - 1] if (c_idx - 1) < len(header) else None
                 # source_file, row_idx, col_idx, col_name, value_float, value_str
                 yield (rel, r_idx, c_idx, col_name, vf, vs)
@@ -350,6 +355,18 @@ def _pick_setting(env_file_values: dict[str, str], *keys: str, default: str = ""
     return default
 
 
+def _pick_setting_with_source(
+    env_file_values: dict[str, str], *keys: str, default: str = ""
+) -> tuple[str, str]:
+    """Return (value, source_label) where source is '環境變數', '.env 檔案', or '預設值'."""
+    for k in keys:
+        if os.environ.get(k):
+            return os.environ[k], "環境變數"
+        if env_file_values.get(k):
+            return env_file_values[k], ".env 檔案"
+    return default, "預設值"
+
+
 def _parse_int(value: str, default: int) -> int:
     try:
         return int(value)
@@ -358,8 +375,9 @@ def _parse_int(value: str, default: int) -> int:
 
 
 def _resolve_db_config(env_file_values: dict[str, str]) -> tuple[dict[str, str], str]:
+    host, cfg_src = _pick_setting_with_source(env_file_values, "MARIADB_HOST", "DB_HOST")
     cfg = {
-        "host": _pick_setting(env_file_values, "MARIADB_HOST", "DB_HOST"),
+        "host": host,
         "port": _pick_setting(env_file_values, "MARIADB_PORT", "DB_PORT", default="3306"),
         "user": _pick_setting(env_file_values, "MARIADB_USER", "DB_USER"),
         "password": _pick_setting(env_file_values, "MARIADB_PASSWORD", "DB_PASSWORD"),
@@ -368,7 +386,7 @@ def _resolve_db_config(env_file_values: dict[str, str]) -> tuple[dict[str, str],
     missing = [k for k in ("host", "user", "password", "database") if not cfg[k]]
     if missing:
         return {}, f"缺少欄位: {', '.join(missing)}"
-    return cfg, ".env/environment"
+    return cfg, cfg_src
 
 
 def main() -> int:
@@ -423,6 +441,7 @@ def main() -> int:
     try:
         cur = cn.cursor()
         processed = 0
+        failed = 0
         total_inserted = 0
 
         for csv_path in csv_files:
@@ -436,51 +455,78 @@ def main() -> int:
             )
 
             table = plan.table_name
+            table_created_this_run = False
 
-            exists = _table_exists(cur, table)
-            if exists and if_exists == "skip":
-                processed += 1
-                continue
-            if exists and if_exists == "drop":
-                _drop_table(cur, table)
+            try:
+                exists = _table_exists(cur, table)
+                if exists and if_exists == "skip":
+                    processed += 1
+                    continue
+                if exists and if_exists == "drop":
+                    _drop_table(cur, table)
+                    # DDL triggers implicit commit in MariaDB — cannot be rolled back
 
-            if not _table_exists(cur, table):
+                if not _table_exists(cur, table):
+                    if plan.mode == "wide":
+                        _create_table_wide(cur, table, plan.columns)
+                    else:
+                        _create_table_long(cur, table)
+                    table_created_this_run = True
+                    # DDL triggers implicit commit — table now exists permanently
+
                 if plan.mode == "wide":
-                    _create_table_wide(cur, table, plan.columns)
+                    inserted = _insert_wide(
+                        cur,
+                        table,
+                        plan,
+                        csv_path,
+                        encoding=encoding,
+                        batch_size=batch_size,
+                    )
                 else:
-                    _create_table_long(cur, table)
+                    inserted = _insert_long(
+                        cur,
+                        table,
+                        plan,
+                        csv_path,
+                        encoding=encoding,
+                        batch_size=batch_size,
+                    )
 
-            if plan.mode == "wide":
-                inserted = _insert_wide(
-                    cur,
-                    table,
-                    plan,
-                    csv_path,
-                    encoding=encoding,
-                    batch_size=batch_size,
-                )
-            else:
-                inserted = _insert_long(
-                    cur,
-                    table,
-                    plan,
-                    csv_path,
-                    encoding=encoding,
-                    batch_size=batch_size,
+                cn.commit()
+                processed += 1
+                total_inserted += inserted
+                print(
+                    f"[OK] {plan.source_relpath} -> {db_cfg['database']}.{table} ({plan.mode}) inserted={inserted}"
                 )
 
-            cn.commit()
-            processed += 1
-            total_inserted += inserted
-            print(
-                f"[OK] {plan.source_relpath} -> {db_cfg['database']}.{table} ({plan.mode}) inserted={inserted}"
-            )
+            except Exception as file_err:
+                # Roll back uncommitted INSERTs for this file only
+                try:
+                    cn.rollback()
+                except Exception:
+                    pass
+                # If this run created the table but INSERT failed, drop the orphaned empty table
+                if table_created_this_run and _table_exists(cur, table):
+                    try:
+                        _drop_table(cur, table)
+                        print(f"[WARN] 已清除本次建立的空表 {table}", file=sys.stderr)
+                    except Exception:
+                        pass
+                failed += 1
+                print(
+                    f"[ERROR] {plan.source_relpath} 匯入失敗（已 rollback 本檔 INSERT，前面已成功的檔案不受影響）：{file_err}",
+                    file=sys.stderr,
+                )
 
-        print(f"完成：files={processed}, inserted_rows={total_inserted}")
-        return 0
+        print(f"完成：files={processed}, failed={failed}, inserted_rows={total_inserted}")
+        return 0 if failed == 0 else 1
     except Exception as e:
-        cn.rollback()
-        print(f"失敗，已 rollback：{e}", file=sys.stderr)
+        try:
+            cn.rollback()
+        except Exception:
+            pass
+        print(f"連線或初始化失敗：{e}", file=sys.stderr)
         return 1
     finally:
         try:

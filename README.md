@@ -2,7 +2,7 @@
 
 ## CSV 匯入 MariaDB（自動建表）
 
-此專案提供 `src/import_csv_to_sqlserver.py`，可將 `data/` 底下的 CSV **遞迴掃描**後匯入 MariaDB。
+此專案提供 `src/import_csv_to_mariadb.py`，可將 `data/` 底下的 CSV **遞迴掃描**後匯入 MariaDB。
 
 ### 1) 安裝
 
@@ -33,13 +33,13 @@ MARIADB_DATABASE=YOUR_DB
 
 ```bash
 # 在 env/.env 設定 IMPORT_LIMIT_FILES=1 後再執行
-python3 src/import_csv_to_sqlserver.py
+python3 src/import_csv_to_mariadb.py
 ```
 
 正式全量匯入：
 
 ```bash
-python3 src/import_csv_to_sqlserver.py
+python3 src/import_csv_to_mariadb.py
 ```
 
 ### 4) 自動建表規則（重點）
