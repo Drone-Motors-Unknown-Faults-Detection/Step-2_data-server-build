@@ -212,3 +212,7 @@ __marimo__/
 
 # data/
 *.csv
+
+.claude/
+.cursor/
+.vscode/
