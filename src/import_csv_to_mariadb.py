@@ -444,7 +444,9 @@ def main() -> int:
         failed = 0
         total_inserted = 0
 
-        for csv_path in csv_files:
+        total_files = len(csv_files)
+        for file_idx, csv_path in enumerate(csv_files, start=1):
+            print(f"[{file_idx}/{total_files}] 處理中: {csv_path.name}")
             plan = _infer_plan(
                 csv_path,
                 data_root,
