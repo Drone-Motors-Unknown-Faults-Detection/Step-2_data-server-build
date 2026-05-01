@@ -212,7 +212,10 @@ __marimo__/
 
 # data/
 *.csv
-csv.zip
+data/csv.zip
+data/T1.zip
+data/T2.zip
+data/T3.zip
 
 .claude/
 .cursor/
